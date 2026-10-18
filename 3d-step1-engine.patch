@@ -1,0 +1,295 @@
+diff --git a/Robust.Client/Graphics/Clyde/Clyde.HLR.cs b/Robust.Client/Graphics/Clyde/Clyde.HLR.cs
+index 09ddbac..7313973 100644
+--- a/Robust.Client/Graphics/Clyde/Clyde.HLR.cs
++++ b/Robust.Client/Graphics/Clyde/Clyde.HLR.cs
+@@ -536,7 +536,17 @@ namespace Robust.Client.Graphics.Clyde
+                 var worldBounds = CalcWorldBounds(viewport);
+                 var worldAABB = worldBounds.CalcBoundingBox();
+ 
+-                if (eye.Position.MapId != MapId.Nullspace)
++                var use3D = ShouldRender3D(eye);
++
++                if (use3D)
++                {
++                    using (DebugGroup("Scene3D"))
++                    using (_prof.Group("Scene3D"))
++                    {
++                        Render3DScene(viewport);
++                    }
++                }
++                else if (eye.Position.MapId != MapId.Nullspace)
+                 {
+                     using (DebugGroup("Lights"))
+                     using (_prof.Group("Lights"))
+@@ -600,7 +610,7 @@ namespace Robust.Client.Graphics.Clyde
+                         UIBox2.FromDimensions(Vector2.Zero, viewport.Size), new Color(1, 1, 1, 0.5f));
+                 }
+ 
+-                if (eye.Position.MapId != MapId.Nullspace)
++                if (!use3D && eye.Position.MapId != MapId.Nullspace)
+                 {
+                     using (_prof.Group("Overlays WS"))
+                     {
+diff --git a/Robust.Client/Graphics/Clyde/Clyde.Render3D.cs b/Robust.Client/Graphics/Clyde/Clyde.Render3D.cs
+new file mode 100644
+index 0000000..6201783
+--- /dev/null
++++ b/Robust.Client/Graphics/Clyde/Clyde.Render3D.cs
+@@ -0,0 +1,150 @@
++using System;
++using System.Numerics;
++using System.Runtime.InteropServices;
++using OpenToolkit.Graphics.OpenGL4;
++using Robust.Shared.Maths;
++
++namespace Robust.Client.Graphics.Clyde
++{
++    internal partial class Clyde
++    {
++        // Один исходник на обе стадии: _compileProgram добавляет #define VERTEX_SHADER / FRAGMENT_SHADER.
++        private const string Scene3DShaderSource = @"
++#ifdef GL_ES
++precision highp float;
++#endif
++#ifdef VERTEX_SHADER
++in vec3 aPos;
++in vec4 aColor;
++uniform mat4 uViewProj;
++out vec4 vColor;
++void main()
++{
++    gl_Position = uViewProj * vec4(aPos, 1.0);
++    vColor = aColor;
++}
++#endif
++#ifdef FRAGMENT_SHADER
++in vec4 vColor;
++out vec4 fragColor;
++void main()
++{
++    fragColor = vColor;
++}
++#endif
++";
++
++        private static readonly (string, uint)[] Scene3DAttribLocations =
++        {
++            ("aPos", 0),
++            ("aColor", 1),
++        };
++
++        private GLShaderProgram? _program3D;
++        private GLBuffer? _vbo3D;
++        private uint _vao3D;
++        private bool _scene3DFailed;
++
++        private bool ShouldRender3D(IEye eye)
++        {
++            return Scene3D.Enabled
++                   && !_scene3DFailed
++                   && Scene3D.TargetEye != null
++                   && ReferenceEquals(eye, Scene3D.TargetEye);
++        }
++
++        private unsafe bool EnsureScene3DResources()
++        {
++            if (_program3D != null)
++                return true;
++
++            try
++            {
++                _program3D = _compileProgram(
++                    Scene3DShaderSource, Scene3DShaderSource, Scene3DAttribLocations, "scene3d", includeLib: false);
++            }
++            catch (ShaderCompilationException e)
++            {
++                _clydeSawmill.Error($"Scene3D: shader compilation failed, disabling 3D: {e}");
++                _scene3DFailed = true;
++                return false;
++            }
++
++            _vao3D = GenVertexArray();
++            BindVertexArray(_vao3D);
++            CheckGlError();
++
++            _vbo3D = new GLBuffer(
++                this, BufferTarget.ArrayBuffer, BufferUsageHint.StreamDraw, 4096 * sizeof(Vertex3D), "Scene3D VBO");
++            _vbo3D.Use();
++
++            GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, sizeof(Vertex3D), 0);
++            GL.EnableVertexAttribArray(0);
++            GL.VertexAttribPointer(1, 4, VertexAttribPointerType.Float, false, sizeof(Vertex3D), 3 * sizeof(float));
++            GL.EnableVertexAttribArray(1);
++            CheckGlError();
++
++            BindVertexArray(BatchVAO.Handle);
++            CheckGlError();
++            return true;
++        }
++
++        private void Render3DScene(Viewport viewport)
++        {
++            if (!EnsureScene3DResources())
++                return;
++
++            // Завершить всё, что накопилось в очереди 2D-рендера, и сбросить её состояние.
++            FlushRenderQueue();
++
++            var sky = Color.FromSrgb(Scene3D.SkyColor);
++
++            IsBlending = false;
++            GL.Enable(EnableCap.DepthTest);
++            GL.DepthFunc(DepthFunction.Less);
++            GL.DepthMask(true);
++            GL.ClearDepth(1);
++            GL.ClearColor(sky.R, sky.G, sky.B, 1f);
++            GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
++            CheckGlError();
++
++            var vertices = Scene3D.Vertices;
++            if (vertices.Count > 0)
++            {
++                var size = viewport.RenderTarget.Size;
++                var aspect = size.X / (float) Math.Max(1, size.Y);
++
++                var cp = MathF.Cos(Scene3D.Pitch);
++                var forward = new Vector3(
++                    MathF.Sin(Scene3D.Yaw) * cp,
++                    MathF.Sin(Scene3D.Pitch),
++                    -MathF.Cos(Scene3D.Yaw) * cp);
++
++                var view = Matrix4x4.CreateLookAt(
++                    Scene3D.CameraPosition, Scene3D.CameraPosition + forward, Vector3.UnitY);
++                var proj = Matrix4x4.CreatePerspectiveFieldOfView(
++                    Scene3D.FovDegrees * MathF.PI / 180f, aspect, 0.05f, 300f);
++
++                // System.Numerics — «строчная» конвенция: view * proj; в шейдер грузим без транспонирования.
++                var viewProj = view * proj;
++
++                _program3D!.Use();
++                _program3D.SetUniform("uViewProj", viewProj, false);
++
++                BindVertexArray(_vao3D);
++                _vbo3D!.Reallocate(CollectionsMarshal.AsSpan(vertices));
++
++                GL.DrawArrays(PrimitiveType.Triangles, 0, vertices.Count);
++                CheckGlError();
++                _debugStats.LastGLDrawCalls += 1;
++            }
++
++            // Вернуть состояние, которое ожидает остальной рендерер.
++            GL.DepthMask(false);
++            GL.Disable(EnableCap.DepthTest);
++            IsBlending = true;
++            BindVertexArray(BatchVAO.Handle);
++            CheckGlError();
++        }
++    }
++}
+diff --git a/Robust.Client/Graphics/Scene3D.cs b/Robust.Client/Graphics/Scene3D.cs
+new file mode 100644
+index 0000000..98b3f00
+--- /dev/null
++++ b/Robust.Client/Graphics/Scene3D.cs
+@@ -0,0 +1,101 @@
++using System;
++using System.Collections.Generic;
++using System.Numerics;
++using System.Runtime.InteropServices;
++using Robust.Shared.Graphics;
++using Robust.Shared.Maths;
++
++namespace Robust.Client.Graphics;
++
++/// <summary>
++/// Публичный API экспериментального 3D-прохода. Content заполняет сцену (треугольники + камера),
++/// а Clyde рисует её вместо обычного 2D-мира, когда <see cref="Enabled"/> = true.
++/// Система координат: X — вправо, Y — вверх, Z — «на зрителя». Мировая 2D-точка (x, y) = 3D (x, h, -y),
++/// поэтому yaw = 0 смотрит на «север» (мировой +Y).
++/// </summary>
++public static class Scene3D
++{
++    public static bool Enabled;
++
++    /// <summary>
++    /// Глаз, для которого включён 3D (обычно IEyeManager.CurrentEye). Остальные viewport'ы рисуются как обычно.
++    /// </summary>
++    public static IEye? TargetEye;
++
++    public static Vector3 CameraPosition = new(0f, 1.6f, 0f);
++
++    /// <summary>Поворот камеры вокруг вертикали, радианы. Положительный — вправо.</summary>
++    public static float Yaw;
++
++    /// <summary>Наклон камеры, радианы. Положительный — вверх.</summary>
++    public static float Pitch;
++
++    public static float FovDegrees = 75f;
++
++    /// <summary>Цвет фона (в sRGB, как обычные цвета).</summary>
++    public static Color SkyColor = new(0.05f, 0.06f, 0.09f, 1f);
++
++    internal static readonly List<Vertex3D> Vertices = new();
++
++    public static void Clear()
++    {
++        Vertices.Clear();
++    }
++
++    public static void AddTriangle(Vector3 a, Vector3 b, Vector3 c, Color color)
++    {
++        var linear = Color.FromSrgb(color);
++        Vertices.Add(new Vertex3D(a, linear));
++        Vertices.Add(new Vertex3D(b, linear));
++        Vertices.Add(new Vertex3D(c, linear));
++    }
++
++    public static void AddQuad(Vector3 a, Vector3 b, Vector3 c, Vector3 d, Color color)
++    {
++        var linear = Color.FromSrgb(color);
++        Vertices.Add(new Vertex3D(a, linear));
++        Vertices.Add(new Vertex3D(b, linear));
++        Vertices.Add(new Vertex3D(c, linear));
++        Vertices.Add(new Vertex3D(a, linear));
++        Vertices.Add(new Vertex3D(c, linear));
++        Vertices.Add(new Vertex3D(d, linear));
++    }
++
++    /// <summary>Коробка без дна (дно всё равно не видно). Грани слегка затемнены для объёма.</summary>
++    public static void AddBox(Vector3 min, Vector3 max, Color color)
++    {
++        float x0 = min.X, y0 = min.Y, z0 = min.Z;
++        float x1 = max.X, y1 = max.Y, z1 = max.Z;
++
++        // верх
++        AddQuad(new(x0, y1, z0), new(x1, y1, z0), new(x1, y1, z1), new(x0, y1, z1), Shade(color, 1.0f));
++        // +Z
++        AddQuad(new(x0, y0, z1), new(x1, y0, z1), new(x1, y1, z1), new(x0, y1, z1), Shade(color, 0.8f));
++        // -Z
++        AddQuad(new(x1, y0, z0), new(x0, y0, z0), new(x0, y1, z0), new(x1, y1, z0), Shade(color, 0.6f));
++        // +X
++        AddQuad(new(x1, y0, z1), new(x1, y0, z0), new(x1, y1, z0), new(x1, y1, z1), Shade(color, 0.7f));
++        // -X
++        AddQuad(new(x0, y0, z0), new(x0, y0, z1), new(x0, y1, z1), new(x0, y1, z0), Shade(color, 0.9f));
++    }
++
++    private static Color Shade(Color c, float k)
++    {
++        return new Color(c.R * k, c.G * k, c.B * k, c.A);
++    }
++}
++
++[StructLayout(LayoutKind.Sequential)]
++internal readonly struct Vertex3D
++{
++    public readonly Vector3 Position;
++
++    // Цвет уже в линейном пространстве (как у Vertex2D).
++    public readonly Color Color;
++
++    public Vertex3D(Vector3 position, Color color)
++    {
++        Position = position;
++        Color = color;
++    }
++}

@@ -536,7 +536,17 @@ namespace Robust.Client.Graphics.Clyde
                 var worldBounds = CalcWorldBounds(viewport);
                 var worldAABB = worldBounds.CalcBoundingBox();
 
-                if (eye.Position.MapId != MapId.Nullspace)
+                var use3D = ShouldRender3D(eye);
+
+                if (use3D)
+                {
+                    using (DebugGroup("Scene3D"))
+                    using (_prof.Group("Scene3D"))
+                    {
+                        Render3DScene(viewport);
+                    }
+                }
+                else if (eye.Position.MapId != MapId.Nullspace)
                 {
                     using (DebugGroup("Lights"))
                     using (_prof.Group("Lights"))
@@ -600,7 +610,7 @@ namespace Robust.Client.Graphics.Clyde
                         UIBox2.FromDimensions(Vector2.Zero, viewport.Size), new Color(1, 1, 1, 0.5f));
                 }
 
-                if (eye.Position.MapId != MapId.Nullspace)
+                if (!use3D && eye.Position.MapId != MapId.Nullspace)
                 {
                     using (_prof.Group("Overlays WS"))
                     {
